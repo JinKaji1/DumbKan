@@ -3,7 +3,13 @@ const express = require('express');
 const fs = require('fs').promises;
 const path = require('path');
 const cookieParser = require('cookie-parser');
+const crypto = require('crypto');
+const fsSync = require('fs');
 const app = express();
+app.set('etag', false);
+
+const DATA_FILE = 'data/tasks.json';
+const revOf = (text) => crypto.createHash('sha1').update(text).digest('hex');
 
 // Brute force protection setup
 const MAX_ATTEMPTS = 5;
@@ -47,7 +53,7 @@ setInterval(() => {
     }
 }, LOCKOUT_TIME);
 
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
 
 // Ensure data directory and tasks.json exist
@@ -1265,6 +1271,25 @@ const html = `<!DOCTYPE html>
     </div>
 
     <script>
+        // Conflict detection: remember the revision of the last board read, send it with
+        // every save, and reload if someone else saved in between. Wrapping fetch covers
+        // every existing load/save call without touching them.
+        let boardRev = null;
+        const rawFetch = window.fetch.bind(window);
+        window.fetch = async (url, opts = {}) => {
+            if (url !== '/data/tasks.json') return rawFetch(url, opts);
+            const isSave = (opts.method || 'GET').toUpperCase() === 'POST';
+            if (isSave) opts = { ...opts, headers: { ...opts.headers, 'X-Rev-Match': boardRev || '' } };
+            const res = await rawFetch(url, opts);
+            if (res.status === 409) {
+                alert('The board was changed somewhere else. Reloading - please redo your last change.');
+                location.reload();
+                return new Promise(() => {}); // stop the caller; the page is reloading
+            }
+            if (res.ok && res.headers.get('X-Rev')) boardRev = res.headers.get('X-Rev');
+            return res;
+        };
+
         // DOM Elements
         const board = document.querySelector('.board');
         const columns = document.querySelectorAll('.column');
@@ -2800,20 +2825,43 @@ app.get('/login', async (req, res) => {
     </html>`);
 });
 
-app.get('/data/tasks.json', requirePin, async (_, res) => {
+// Every read returns the file's revision in X-Rev; every write must send the revision it
+// was based on in X-Rev-Match. A stale write gets 409 instead of silently overwriting
+// someone else's change (another tab, or the board CLI).
+// ponytail: sync fs keeps check-and-write atomic in the single event loop; the file is tiny.
+// A malformed write leaves the UI blank, so refuse anything the client can't render.
+function validBoards(body) {
+    const isObj = (o) => o && typeof o === 'object' && !Array.isArray(o);
+    return isObj(body) && isObj(body.boards) && Object.values(body.boards).every(b =>
+        isObj(b) && typeof b.name === 'string' && isObj(b.columns) && Object.values(b.columns).every(c =>
+            isObj(c) && typeof c.name === 'string' && Array.isArray(c.tasks) && c.tasks.every(t => typeof t === 'string')));
+}
+
+app.get('/data/tasks.json', requirePin, (_, res) => {
     try {
-        const data = await fs.readFile('data/tasks.json', 'utf8');
-        res.json(JSON.parse(data));
+        const text = fsSync.readFileSync(DATA_FILE, 'utf8');
+        res.set('X-Rev', revOf(text)).set('Cache-Control', 'no-store').json(JSON.parse(text));
     } catch (error) {
         console.error('Error reading tasks:', error);
         res.status(500).json({ error: 'Failed to read tasks' });
     }
 });
 
-app.post('/data/tasks.json', requirePin, async (req, res) => {
+app.post('/data/tasks.json', requirePin, (req, res) => {
     try {
-        await fs.writeFile('data/tasks.json', JSON.stringify(req.body, null, 2));
-        res.json({ ok: true });
+        const expected = req.get('X-Rev-Match');
+        if (!expected) return res.status(428).json({ error: 'X-Rev-Match header required' });
+        const current = revOf(fsSync.readFileSync(DATA_FILE, 'utf8'));
+        if (expected !== current) {
+            return res.status(409).set('X-Rev', current).json({ error: 'Board changed since it was loaded' });
+        }
+        if (!validBoards(req.body)) {
+            return res.status(400).json({ error: 'Body must be { boards: { id: { name, columns: { id: { name, tasks: [string] } } } } }' });
+        }
+        const text = JSON.stringify(req.body, null, 2);
+        fsSync.writeFileSync(DATA_FILE + '.tmp', text);
+        fsSync.renameSync(DATA_FILE + '.tmp', DATA_FILE);
+        res.set('X-Rev', revOf(text)).json({ ok: true });
     } catch (error) {
         console.error('Error saving tasks:', error);
         res.status(500).json({ error: 'Failed to save' });
