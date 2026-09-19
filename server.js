@@ -2869,8 +2869,10 @@ app.post('/data/tasks.json', requirePin, (req, res) => {
 });
 
 // Start server
-app.listen(process.env.PORT || 3000, () => {
-    console.log(`Running on port ${process.env.PORT || 3000}`);
+// HOST pins the listener to one address (e.g. a Tailscale IP); unset listens everywhere.
+// If that address isn't up yet the bind fails and the process exits, so a supervisor retries.
+app.listen(process.env.PORT || 3000, process.env.HOST, () => {
+    console.log(`Running on ${process.env.HOST || '*'}:${process.env.PORT || 3000}`);
     if (process.env.DUMBKAN_PIN) {
         console.log('PIN protection enabled');
     }
